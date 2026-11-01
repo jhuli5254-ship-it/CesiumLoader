@@ -1,0 +1,71 @@
+name: Combat core full repository validation
+
+on:
+  push:
+    branches: [ci/combat-core-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  complete-managed-suite:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Verify game references
+        shell: pwsh
+        run: |
+          $manifest = Get-Content refs/game/sources.json -Raw | ConvertFrom-Json
+          foreach ($assembly in $manifest.assemblies.PSObject.Properties) {
+            $actual = (Get-FileHash -LiteralPath "refs/game/$($assembly.Name)" -Algorithm SHA256).Hash
+            if ($actual -ine $assembly.Value) { throw "Reference mismatch: $($assembly.Name)" }
+          }
+      - name: Build every managed project
+        shell: pwsh
+        run: |
+          $projects = @(Get-ChildItem -Recurse -File -Filter *.csproj |
+            Where-Object { $_.FullName -notmatch '\\(obj|bin|artifacts|staging|sdk-staging|agent-staging)\\' } |
+            Sort-Object FullName)
+          foreach ($project in $projects) {
+            Write-Host "BUILD $($project.FullName)"
+            dotnet build $project.FullName -c Release --nologo -v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "Build failed: $($project.FullName)" }
+          }
+          Write-Host "Managed projects built: $($projects.Count)"
+      - name: Run every original xUnit project including added regressions
+        shell: pwsh
+        run: |
+          $projects = @(Get-ChildItem tests -Directory | ForEach-Object {
+            Get-ChildItem $_.FullName -Filter *.csproj -File | Select-Object -First 1
+          } | Where-Object { $_ -and (Select-String -LiteralPath $_.FullName -Pattern 'xunit' -Quiet) } | Sort-Object Name)
+          $failed = @()
+          foreach ($project in $projects) {
+            Write-Host "TEST $($project.BaseName)"
+            dotnet test $project.FullName -c Release --no-build --no-restore --nologo `
+              --logger "trx;LogFileName=$($project.BaseName).trx" --results-directory artifacts/test-results
+            if ($LASTEXITCODE -ne 0) { $failed += $project.BaseName }
+          }
+          $runs = @(Get-ChildItem artifacts/test-results -Filter *.trx | ForEach-Object {
+            $xml = [xml](Get-Content $_.FullName -Raw)
+            $c = $xml.TestRun.ResultSummary.Counters
+            [pscustomobject]@{Project=$_.BaseName;Total=[int]$c.total;Passed=[int]$c.passed;Failed=[int]$c.failed;Skipped=[int]$c.notExecuted}
+          })
+          $summary = [pscustomobject]@{Projects=$runs.Count;Total=($runs | Measure-Object Total -Sum).Sum;Passed=($runs | Measure-Object Passed -Sum).Sum;Failed=($runs | Measure-Object Failed -Sum).Sum;Skipped=($runs | Measure-Object Skipped -Sum).Sum;Runs=$runs}
+          $summary | ConvertTo-Json -Depth 4 | Set-Content artifacts/test-summary.json
+          Write-Host ('TEST_SUMMARY=' + ($summary | ConvertTo-Json -Depth 4 -Compress))
+          if ($failed.Count) { throw "Tests failed: $($failed -join ', ')" }
+          Write-Host "All $($projects.Count) test projects passed."
+      - name: Upload original TRX results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-repository-test-results
+          path: |
+            artifacts/test-results/*.trx
+            artifacts/test-summary.json
+          if-no-files-found: warn
